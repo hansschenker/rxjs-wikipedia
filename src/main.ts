@@ -4,6 +4,7 @@ import {
   catchError,
   debounceTime,
   distinctUntilChanged,
+  filter,
   map,
   shareReplay,
   startWith,
@@ -36,6 +37,7 @@ type PersistedSuggestions = {
 };
 
 const STORAGE_KEY = "wiki_autosuggest_v1";
+const PERSIST_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 function savePersisted(v: PersistedSuggestions) {
   try {
@@ -51,6 +53,10 @@ function loadPersisted(): PersistedSuggestions | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as PersistedSuggestions;
     if (!parsed || typeof parsed.term !== "string" || !Array.isArray(parsed.items)) return null;
+    if (Date.now() - parsed.savedAt > PERSIST_TTL_MS) {
+      sessionStorage.removeItem(STORAGE_KEY);
+      return null;
+    }
     return parsed;
   } catch {
     return null;
@@ -95,11 +101,24 @@ function clear(el: Element) {
   while (el.firstChild) el.removeChild(el.firstChild);
 }
 
-function renderSuggestions(ul: HTMLUListElement, items: Suggestion[]) {
+function renderSuggestions(
+  input: HTMLInputElement,
+  ul: HTMLUListElement,
+  items: Suggestion[],
+  activeIndex = -1,
+) {
   clear(ul);
 
-  for (const s of items) {
+  const hasItems = items.length > 0;
+  input.setAttribute("aria-expanded", String(hasItems));
+
+  for (let i = 0; i < items.length; i++) {
+    const s = items[i];
     const li = document.createElement("li");
+    li.id = `suggestion-${i}`;
+    li.setAttribute("role", "option");
+    li.setAttribute("aria-selected", String(i === activeIndex));
+
     const href = document.createElement("a");
     href.textContent = s.title;
     href.href = s.url ?? "#";
@@ -110,6 +129,13 @@ function renderSuggestions(ul: HTMLUListElement, items: Suggestion[]) {
 
     li.appendChild(href);
     ul.appendChild(li);
+  }
+
+  // Point aria-activedescendant at the highlighted item, or clear it
+  if (activeIndex >= 0 && activeIndex < items.length) {
+    input.setAttribute("aria-activedescendant", `suggestion-${activeIndex}`);
+  } else {
+    input.setAttribute("aria-activedescendant", "");
   }
 }
 
@@ -141,7 +167,7 @@ export function bindWikipediaAutosuggest(opts: {
   if (restored) {
     opts.input.value = restored.term;
     renderStatus(opts.status, initialState);
-    renderSuggestions(opts.suggestionsList, restored.items);
+    renderSuggestions(opts.input, opts.suggestionsList, restored.items);
   }
 
   // text over time (emits even when empty, so we can clear the UI)
@@ -160,7 +186,6 @@ export function bindWikipediaAutosuggest(opts: {
 
       return searchWikipedia(term, limit).pipe(
         map((data) => ({ kind: "done", term, items: toSuggestions(data) }) as SuggestState),
-        startWith({ kind: "loading", term, items: [] } as SuggestState),
         catchError((e: unknown) =>
           of<SuggestState>({
             kind: "error",
@@ -168,7 +193,8 @@ export function bindWikipediaAutosuggest(opts: {
             items: [],
             error: e instanceof Error ? e.message : String(e),
           })
-        )
+        ),
+        startWith({ kind: "loading", term, items: [] } as SuggestState),
       );
     }),
     // Emit restored suggestions first so UI has something immediately on reload/back
@@ -176,10 +202,21 @@ export function bindWikipediaAutosuggest(opts: {
     shareReplay({ bufferSize: 1, refCount: true })
   );
 
+  // Cache the latest state so the click/keyboard handlers can read it without scraping the DOM
+  let lastState: SuggestState = initialState;
+  let activeIndex = -1;
+
+  function applyActiveIndex(index: number) {
+    activeIndex = index;
+    renderSuggestions(opts.input, opts.suggestionsList, lastState.items, activeIndex);
+  }
+
   // render + persist
   const sub = state$.subscribe((s) => {
+    lastState = s;
+    activeIndex = -1;
     renderStatus(opts.status, s);
-    renderSuggestions(opts.suggestionsList, s.items);
+    renderSuggestions(opts.input, opts.suggestionsList, s.items);
 
     // Persist only meaningful results
     if (s.kind === "done" && s.items.length > 0) {
@@ -189,6 +226,42 @@ export function bindWikipediaAutosuggest(opts: {
     // If user clears input (or below min length), drop persisted list
     if (s.kind === "idle" && s.term.length < minLength) {
       clearPersisted();
+    }
+  });
+
+  // Keyboard navigation: ArrowDown, ArrowUp, Enter, Escape
+  const keySub = fromEvent<KeyboardEvent>(opts.input, "keydown").pipe(
+    filter((e) =>
+      e.key === "ArrowDown" || e.key === "ArrowUp" ||
+      e.key === "Enter" || e.key === "Escape"
+    )
+  ).subscribe((e) => {
+    const items = lastState.items;
+
+    if (e.key === "Escape") {
+      applyActiveIndex(-1);
+      opts.input.blur();
+      return;
+    }
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      applyActiveIndex(Math.min(activeIndex + 1, items.length - 1));
+      return;
+    }
+
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      applyActiveIndex(Math.max(activeIndex - 1, -1));
+      return;
+    }
+
+    if (e.key === "Enter" && activeIndex >= 0 && activeIndex < items.length) {
+      e.preventDefault();
+      const selected = items[activeIndex];
+      if (selected.url) window.open(selected.url, "_blank", "noopener,noreferrer");
+      opts.input.value = selected.title;
+      savePersisted({ term: selected.title, items, savedAt: Date.now() });
     }
   });
 
@@ -202,29 +275,29 @@ export function bindWikipediaAutosuggest(opts: {
     const title = a.textContent ?? "";
     if (title) opts.input.value = title;
 
-    // Ensure the current rendered list is persisted (in case nothing was typed after restore)
-    const items = Array.from(opts.suggestionsList.querySelectorAll("a")).map((el) => ({
-      title: el.textContent ?? "",
-      url: (el as HTMLAnchorElement).href,
-    })) as Suggestion[];
-
-    if (title && items.length > 0) {
-      savePersisted({ term: title, items, savedAt: Date.now() });
+    // Use cached stream state — avoids DOM scraping and the el.href absolute-URL bug
+    if (title && lastState.items.length > 0) {
+      savePersisted({ term: title, items: lastState.items, savedAt: Date.now() });
     }
   });
 
   return {
     unsubscribe() {
       sub.unsubscribe();
+      keySub.unsubscribe();
       clickSub.unsubscribe();
     },
   };
 }
 
 // --- usage ---
-const input = document.querySelector<HTMLInputElement>("#search")!;
-const status = document.querySelector<HTMLElement>("#status")!;
-const suggestionsList = document.querySelector<HTMLUListElement>("#suggestions")!;
+const input = document.querySelector<HTMLInputElement>("#search");
+const status = document.querySelector<HTMLElement>("#status");
+const suggestionsList = document.querySelector<HTMLUListElement>("#suggestions");
+
+if (!input) throw new Error("Missing required element: #search");
+if (!status) throw new Error("Missing required element: #status");
+if (!suggestionsList) throw new Error("Missing required element: #suggestions");
 
 const binding = bindWikipediaAutosuggest({ input, status, suggestionsList });
 // later: binding.unsubscribe()

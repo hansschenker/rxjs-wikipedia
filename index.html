@@ -7,9 +7,20 @@
     <title>rxjs-wikipedia</title>
   </head>
   <body>
-    <input id="search" placeholder="Search Wikipedia…" autocomplete="off" />
-    <div id="status"></div>
-    <ul id="suggestions"></ul>
+    <div id="container">
+      <input
+        id="search"
+        placeholder="Search Wikipedia…"
+        autocomplete="off"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls="suggestions"
+        aria-expanded="false"
+        aria-activedescendant=""
+      />
+      <div id="status" role="status" aria-live="polite"></div>
+      <ul id="suggestions" role="listbox" aria-label="Wikipedia suggestions"></ul>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
